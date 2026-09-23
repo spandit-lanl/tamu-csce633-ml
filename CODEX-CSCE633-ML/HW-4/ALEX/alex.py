@@ -1,0 +1,264 @@
+import os
+import torch
+import torchvision
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset
+from PIL import Image
+from sklearn.model_selection import train_test_split
+import argparse
+import numpy as np
+import glob
+from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn
+from time import time
+
+
+class SUN397Dataset(Dataset):
+    """
+    A custom dataset class for loading the SUN397 dataset.
+    """
+
+    def __init__(self, data_dir, transform=None):
+        print(f"[DEBUG] Initializing SUN397Dataset with data_dir={data_dir}")
+        self.image_paths = []
+        self.labels = []
+        self.transform = transform
+        class_folders = sorted([d for d in glob.glob(
+            os.path.join(data_dir, '*', '*')) if os.path.isdir(d)])
+        print(f"[DEBUG] Found {len(class_folders)} class folders")
+        self.class_to_idx = {cls_path: idx for idx,
+                             cls_path in enumerate(class_folders)}
+        for cls_path in class_folders:
+            img_files = glob.glob(os.path.join(cls_path, '*.jpg'))
+            print(f"[DEBUG] Class '{cls_path}' → {len(img_files)} images")
+            for img_file in img_files:
+                self.image_paths.append(img_file)
+                self.labels.append(self.class_to_idx[cls_path])
+        print(f"[DEBUG] Total images loaded: {len(self.image_paths)}")
+
+    def __len__(self):
+        length = len(self.image_paths)
+        print(f"[DEBUG] __len__ called, returning {length}")
+        return length
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        #print(f"[DEBUG] Loading image at index {idx}: {img_path}")
+        image = Image.open(img_path).convert('RGB')
+        label = self.labels[idx]
+        if self.transform:
+            image = self.transform(image)
+            #print(f"[DEBUG] Transform applied to image at index {idx}")
+        return image, torch.tensor(label)
+
+
+class CNN(nn.Module):
+    """
+    Define your CNN Model here
+    """
+
+    def __init__(self, num_classes=10):
+        print(f"[DEBUG] Initializing CNN with num_classes={num_classes}")
+        super(CNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.AdaptiveAvgPool2d((8, 8))
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(512 * 8 * 8, 512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_classes)
+        )
+
+    def forward(self, x):
+        print(f"[DEBUG] Forward pass input shape: {x.shape}")
+        x = self.features(x)
+        print(f"[DEBUG] After features shape: {x.shape}")
+        x = self.classifier(x)
+        print(f"[DEBUG] After classifier shape: {x.shape}")
+        return x
+
+
+def calculate_mean_std(data_dir='./source/data/sun397_split/test/'):
+    pixel_sum = torch.zeros(3)
+    pixel_squared_sum = torch.zeros(3)
+    num_pixels = 0
+    class_folders = sorted([
+        d for d in glob.glob(os.path.join(data_dir, '*', '*')) if os.path.isdir(d)
+    ])
+    for cls_path in class_folders:
+        img_files = glob.glob(os.path.join(cls_path, '*.jpg'))
+        for img_path in img_files:
+            image = Image.open(img_path).convert('RGB')
+            tensor = transforms.ToTensor()(image)
+            pixel_sum += tensor.sum(dim=(1, 2))
+            pixel_squared_sum += (tensor ** 2).sum(dim=(1, 2))
+            num_pixels += tensor.shape[1] * tensor.shape[2]
+    if num_pixels == 0:
+        raise ValueError("No images found.")
+    mean = pixel_sum / num_pixels
+    std = (pixel_squared_sum / num_pixels - mean ** 2).sqrt()
+    print(f"[DEBUG] mean: {mean}")
+    print(f"[DEBUG] std: {std}")
+    return mean.tolist(), std.tolist()
+
+
+def train(model, train_loader, device='cpu', epochs=60, lr=0.0001, save_path='model.pt', **kwargs):
+    print(f"[DEBUG] Starting training for {epochs} epochs on device {device}")
+    model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', patience=5, factor=0.5, verbose=True)
+    best_loss = float('inf')
+    for epoch in range(epochs):
+        print(f"[DEBUG] Epoch {epoch+1} started")
+        model.train()
+        epoch_loss = 0.0
+        correct = 0
+        total = 0
+        with Progress(TextColumn("[bold blue]{task.description}"), BarColumn(), TaskProgressColumn()) as progress:
+            task = progress.add_task(
+                f"Epoch {epoch + 1}/{epochs}", total=len(train_loader))
+            for batch_idx, (images, labels) in enumerate(train_loader):
+                print(
+                    f"[DEBUG] Training batch {batch_idx+1}/{len(train_loader)}")
+                images, labels = images.to(device), labels.to(device)
+                optimizer.zero_grad()
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                print(f"[DEBUG] Batch loss: {loss.item()}")
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                _, predicted = outputs.max(1)
+                correct += predicted.eq(labels).sum().item()
+                total += labels.size(0)
+                progress.advance(task)
+        avg_loss = epoch_loss / len(train_loader)
+        acc = 100. * correct / total
+        print(
+            f"[DEBUG] Epoch {epoch + 1}: Loss = {avg_loss:.4f}, Accuracy = {acc:.2f}%")
+        scheduler.step(avg_loss)
+        if avg_loss < best_loss:
+            print(
+                f"[DEBUG] New best loss {avg_loss:.4f}, saving model to {save_path}")
+            best_loss = avg_loss
+            torch.save(model.state_dict(), save_path)
+
+
+def test(model, test_loader, device='cpu', **kwargs):
+    print(f"[DEBUG] Starting testing on device {device}")
+    if os.path.exists('model.pt'):
+        print("[DEBUG] Loading model weights from model.pt")
+        model.load_state_dict(torch.load('model.pt', map_location=device))
+    else:
+        print("[DEBUG] model.pt not found, using current model weights")
+    model.eval()
+    model.to(device)
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch_idx, (images, labels) in enumerate(test_loader):
+            print(f"[DEBUG] Testing batch {batch_idx+1}/{len(test_loader)}")
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, predicted = outputs.max(1)
+            correct += predicted.eq(labels).sum().item()
+            total += labels.size(0)
+    acc = 100. * correct / total
+    print(f"[DEBUG] Test Accuracy: {acc:.2f}%")
+    print(f"Test Accuracy: {acc:.2f}%")
+    return acc
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train_dir', type=str,
+                        default='./data',
+                        help='Path to training data directory')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducibility')
+    args = parser.parse_args()
+    print(f"[DEBUG] Parsed arguments: {args}")
+    return args
+
+
+def main():
+    args = parse_args()
+    train_dir = args.train_dir
+    seed = args.seed
+    print(f"[DEBUG] Setting random seed to {seed}")
+    torch.manual_seed(seed)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"[DEBUG] Using device: {device}")
+    print("Calculating mean and std...")
+    mean, std = calculate_mean_std(data_dir=train_dir)
+    print("Mean:", mean)
+    print("Std:", std)
+    print("[DEBUG] Creating data transforms")
+    train_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std)
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std)
+    ])
+    print("[DEBUG] Loading full dataset")
+    full_dataset = SUN397Dataset(train_dir, transform=None)
+    num_classes = len(set(full_dataset.labels))
+    print(f"[DEBUG] Number of classes: {num_classes}")
+    indices = list(range(len(full_dataset)))
+    labels = full_dataset.labels
+    print("[DEBUG] Splitting dataset into train and validation sets")
+    train_idx, val_idx = train_test_split(
+        indices, test_size=0.1, stratify=labels, random_state=seed)
+    print(
+        f"[DEBUG] Train set size: {len(train_idx)}, Validation set size: {len(val_idx)}")
+    train_dataset = SUN397Dataset(train_dir, transform=train_transform)
+    val_dataset = SUN397Dataset(train_dir, transform=val_transform)
+    train_dataset = torch.utils.data.Subset(train_dataset, train_idx)
+    val_dataset = torch.utils.data.Subset(val_dataset, val_idx)
+    print("[DEBUG] Creating data loaders")
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+    print("[DEBUG] Initializing model")
+    model = CNN(num_classes=num_classes)
+    print("[DEBUG] Starting training process")
+    train(model, train_loader, device=device, epochs=60, save_path='model.pt')
+    print("[DEBUG] Starting testing process")
+    test(model, val_loader, device=device)
+
+
+if __name__ == "__main__":
+    main()
