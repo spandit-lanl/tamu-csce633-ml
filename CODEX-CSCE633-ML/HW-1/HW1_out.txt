@@ -1,0 +1,31 @@
+Linear Regression: Y_VAL_PRED: [ 916.29326799 1098.64790683 1191.95172723 ...  967.52973942 1110.37658533
+ 1071.7062066 ]
+
+
+
+Linear Regression -  RMSE: 76.62736700662319
+Linear Regression: Y_TEST_PRED: [1079.91675535 1220.69924755 1140.1087784  ...  797.75322025  903.01251494
+ 1029.88550228]
+
+
+
+Logistic Regression - f1_score = 0.8980
+Logistic Regression - AUROC= 0.9694
+
+
+Now predicting on the test data
+Logistic Regression: Y_PRED_PROBS: [0.99972424 0.99991705 0.99999477 ... 0.54580885 0.92824376 0.99989194]
+
+
+
+Cross Validation
+
+   Cross-Val Linear Regression: Avg RMSE: 74.93360972547752
+   Cross-Val Linear Regression: Std Dev RMSE: 2.357324712453843 
+
+
+
+
+   Cross-Val Log Regr: Avg F1: 0.9094, Std: 0.0077
+   Cross-Val Log Regr:  Avg AUROC: 0.9702, Std: 0.0026
+Hello World!
